@@ -279,6 +279,12 @@ def score_beats_current_best(new_score, old_score):
     )
 
 
+def _stats_phase_eval_pre_hook(module, args):
+    """Forward pre-hook that keeps the network in eval mode during the stats phase"""
+    if module.training:
+        module.eval()
+
+
 def check_new_best(net, accuracy, epochs_since_cycle_switch):
     """Check if the new accuracy is a new best.
 
@@ -1799,7 +1805,7 @@ class PAINeuronModuleTracker:
         if ("model" not in opt_args.keys()) and "params" not in opt_args.keys():
             print("In setup_optimizer it will be depreciated to not pass in params yourself in the future")
             print("please change the settings to include params")
-            if self.member_vars["mode"] == "n":
+            if self.member_vars["mode"] in ("n", "s"):
                 if parameters is not None:
                     opt_args["params"] = parameters
                 else:
@@ -2309,6 +2315,49 @@ class PAINeuronModuleTracker:
         if GPA.pc.get_reset_best_score_on_switch():
             GPA.pai_tracker.member_vars["current_best_validation_score"] = 0
             GPA.pai_tracker.member_vars["running_accuracy"] = 0
+
+    def set_stats_training(self, net):
+        """Start a one epoch stats phase from a converged checkpoint.
+
+        Neuron weights are not stepped and the network is kept in eval mode
+        while the neuron error averages are gathered. After the next
+        add_validation_score the tracker switches directly to dendrite training.
+
+        Parameters
+        ----------
+        net : object
+            The neural network model, the same one passed to add_validation_score.
+
+        Returns
+        -------
+        None
+            This function does not return a value.
+        """
+        self.member_vars["mode"] = "s"
+        net.eval()
+        # Keep eval even if the training loop calls net.train() each epoch
+        net.register_forward_pre_hook(_stats_phase_eval_pre_hook)
+
+    def end_stats_training(self, net):
+        """Remove the stats phase eval hook and return the network to train mode.
+
+        Parameters
+        ----------
+        net : object
+            The neural network model.
+
+        Returns
+        -------
+        None
+            This function does not return a value.
+        """
+        for key in [
+            k
+            for k, hook in net._forward_pre_hooks.items()
+            if hook is _stats_phase_eval_pre_hook
+        ]:
+            del net._forward_pre_hooks[key]
+        net.train()
 
     def start_epoch(self, internal_call=False):
         """Perform steps for when a new training epoch is about to begin.
@@ -3508,6 +3557,29 @@ class PAINeuronModuleTracker:
                 GPA.pai_tracker.member_vars["num_epochs_run"]
                 - GPA.pai_tracker.member_vars["switch_epochs"][-1]
             )
+
+        # Stats phase is one epoch
+	# Record the checkpoint score as the baseline
+        # and switch straight to dendrite training with the gathered averages
+        if GPA.pai_tracker.member_vars["mode"] == "s":
+            GPA.pai_tracker.stop_epoch(internal_call=True)
+            GPA.pai_tracker.end_stats_training(net)
+            GPA.pai_tracker.member_vars["current_best_validation_score"] = accuracy
+            GPA.pai_tracker.member_vars["global_best_validation_score"] = accuracy
+            GPA.pai_tracker.member_vars["epoch_last_improved"] = (
+                GPA.pai_tracker.member_vars["num_epochs_run"]
+            )
+            UPA.save_system(net, GPA.pc.get_save_name(), "best_model")
+            GPA.pai_tracker.member_vars["mode"] = "n"
+            net = UPA.change_learning_modes(
+                net,
+                GPA.pc.get_save_name(),
+                "best_model",
+                GPA.pai_tracker.member_vars["doing_pai"],
+            )
+            GPA.pai_tracker.clear_optimizer_and_scheduler()
+            GPA.pai_tracker.start_epoch(internal_call=True)
+            return net, NETWORK_RESTRUCTURED, False
 
         update_running_accuracy(accuracy, epochs_since_cycle_switch)
         if GPA.pc.get_perforated_backpropagation():
