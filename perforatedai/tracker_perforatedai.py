@@ -3559,17 +3559,26 @@ class PAINeuronModuleTracker:
             )
 
         # Stats phase is one epoch
-	# Record the checkpoint score as the baseline
-        # and switch straight to dendrite training with the gathered averages
+        # Record the checkpoint score as the baseline
+        # Switch to dendrite training with the gathered averages
         if GPA.pai_tracker.member_vars["mode"] == "s":
+            # Log the stats epoch score as normal
+            # This prevents save_graphs from having an OOB index
+            update_running_accuracy(accuracy, epochs_since_cycle_switch)
+            # End epoch
             GPA.pai_tracker.stop_epoch(internal_call=True)
+            # Remove the eval-mode hook before saving
             GPA.pai_tracker.end_stats_training(net)
+            # Bookkeeping
             GPA.pai_tracker.member_vars["current_best_validation_score"] = accuracy
             GPA.pai_tracker.member_vars["global_best_validation_score"] = accuracy
             GPA.pai_tracker.member_vars["epoch_last_improved"] = (
                 GPA.pai_tracker.member_vars["num_epochs_run"]
             )
+            # Save the model
+	    # `normal_pass_average_d` buffers carry stats through the reload
             UPA.save_system(net, GPA.pc.get_save_name(), "best_model")
+            # Mode "n" so change_learning_modes takes the n->p path
             GPA.pai_tracker.member_vars["mode"] = "n"
             net = UPA.change_learning_modes(
                 net,
@@ -3577,7 +3586,9 @@ class PAINeuronModuleTracker:
                 "best_model",
                 GPA.pai_tracker.member_vars["doing_pai"],
             )
+            # Clear optimizer + Caller rebuilds it
             GPA.pai_tracker.clear_optimizer_and_scheduler()
+            # Open the first p epoch
             GPA.pai_tracker.start_epoch(internal_call=True)
             return net, NETWORK_RESTRUCTURED, False
 
