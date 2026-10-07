@@ -213,7 +213,7 @@ def update_running_accuracy(accuracy, epochs_since_cycle_switch):
 
     """
     # Only update running_accuracy when neurons are being updated
-    if GPA.pai_tracker.member_vars["mode"] == "n" or GPA.pc.get_learn_dendrites_live():
+    if GPA.pai_tracker.member_vars["mode"] == "n":  # or GPA.pc.get_learn_dendrites_live()
         if epochs_since_cycle_switch < GPA.pc.get_initial_history_after_switches():
             if epochs_since_cycle_switch <= 0:
                 GPA.pai_tracker.member_vars["running_accuracy"] = accuracy
@@ -241,7 +241,7 @@ def update_running_accuracy(accuracy, epochs_since_cycle_switch):
     if (
         GPA.pc.get_drawing_pai()
         or GPA.pai_tracker.member_vars["mode"] == "n"
-        or GPA.pc.get_learn_dendrites_live()
+        # or GPA.pc.get_learn_dendrites_live()
     ):
         GPA.pai_tracker.member_vars["running_accuracies"].append(
             GPA.pai_tracker.member_vars["running_accuracy"]
@@ -277,12 +277,6 @@ def score_beats_current_best(new_score, old_score):
         and (new_score * (1.0 + GPA.pc.get_improvement_threshold()) < old_score)
         and (new_score + GPA.pc.get_improvement_threshold_raw()) < old_score
     )
-
-
-def _stats_phase_eval_pre_hook(module, args):
-    """Forward pre-hook that keeps the network in eval mode during the stats phase"""
-    if module.training:
-        module.eval()
 
 
 def check_new_best(net, accuracy, epochs_since_cycle_switch):
@@ -706,7 +700,7 @@ def process_scheduler_update(net, accuracy, epochs_since_cycle_switch):
         # If potentially might have higher accuracy
         (
             (GPA.pai_tracker.member_vars["mode"] == "n")
-            or GPA.pc.get_learn_dendrites_live()
+            # or GPA.pc.get_learn_dendrites_live()
         )
         and
         # And learning rate just stepped
@@ -1050,8 +1044,8 @@ class PAINeuronModuleTracker:
         # Pointers to all non neuron modules for tracking
         self.tracked_neuron_module_vector = []
 
-        # Neuron training or dendrite training mode
-        self.member_vars["mode"] = "n"
+        # Neuron training, dendrite training, or the starting stats phase
+        self.member_vars["mode"] = "s" if GPA.pc.get_start_in_stats_phase() else "n"
         self.member_var_types["mode"] = "string"
 
         # Number of epochs run excluding overwritten epochs
@@ -1805,7 +1799,7 @@ class PAINeuronModuleTracker:
         if ("model" not in opt_args.keys()) and "params" not in opt_args.keys():
             print("In setup_optimizer it will be depreciated to not pass in params yourself in the future")
             print("please change the settings to include params")
-            if self.member_vars["mode"] in ("n", "s"):
+            if self.member_vars["mode"] == "n":
                 if parameters is not None:
                     opt_args["params"] = parameters
                 else:
@@ -1850,7 +1844,15 @@ class PAINeuronModuleTracker:
                 # Handle generators or other iterables
                 opt_args["params"] = [p for p in params_value if p.requires_grad]
 
-        optimizer = self.member_vars["optimizer"](**opt_args)
+        if self.member_vars["mode"] == "s":
+            # Stats phase only gathers neuron error
+	    # We then give the optimizer dummy params
+            net.eval()
+            dummy = torch.nn.Parameter(torch.zeros(1, device=GPA.pc.get_device()))
+            dummy.parameter_type = "neuron"
+            optimizer = torch.optim.Adam([dummy], lr=1e-3)
+        else:
+            optimizer = self.member_vars["optimizer"](**opt_args)
         self.set_optimizer_instance(optimizer)
 
         if self.member_vars["scheduler"] is not None:
@@ -1909,7 +1911,7 @@ class PAINeuronModuleTracker:
                 )
                 current_steps += additional_steps
 
-            if self.member_vars["mode"] == "n" or GPA.pc.get_learn_dendrites_live():
+            if self.member_vars["mode"] == "n":  # or GPA.pc.get_learn_dendrites_live()
                 initial = GPA.pc.get_initial_history_after_switches()
             else:
                 initial = 0
@@ -2016,6 +2018,12 @@ class PAINeuronModuleTracker:
                 print("Returning False - doing no switch mode")
             return False
 
+        # Stats phase always ends at the first add_validation_score
+        if self.member_vars["mode"] == "s":
+            if not GPA.pc.get_silent():
+                print("Returning True - stats phase complete")
+            return True
+
         if self.member_vars["switch_mode"] == GPA.pc.DOING_SWITCH_EVERY_TIME:
             if not GPA.pc.get_silent():
                 print("Returning True - switching every time")
@@ -2026,7 +2034,7 @@ class PAINeuronModuleTracker:
         if GPA.pc.get_verbose():
             print("=== LR Optimization Check ===")
             print(f'  mode == "n": {self.member_vars["mode"] == "n"}')
-            print(f"  get_learn_dendrites_live(): {GPA.pc.get_learn_dendrites_live()}")
+            # print(f"  get_learn_dendrites_live(): {GPA.pc.get_learn_dendrites_live()}")
             print(f'  committed_to_initial_rate: {GPA.pai_tracker.member_vars["committed_to_initial_rate"]}')
             print(f"  get_dont_give_up_unless_learning_rate_lowered(): {GPA.pc.get_dont_give_up_unless_learning_rate_lowered()}")
             print(f'  current_n_learning_rate_initial_skip_steps: {self.member_vars["current_n_learning_rate_initial_skip_steps"]}')
@@ -2036,7 +2044,7 @@ class PAINeuronModuleTracker:
             print("=============================")
         
         if (
-            ((self.member_vars["mode"] == "n") or GPA.pc.get_learn_dendrites_live())
+            (self.member_vars["mode"] == "n")  # or GPA.pc.get_learn_dendrites_live()
             and (GPA.pai_tracker.member_vars["committed_to_initial_rate"] is False)
             and (GPA.pc.get_dont_give_up_unless_learning_rate_lowered())
             and (
@@ -2054,9 +2062,11 @@ class PAINeuronModuleTracker:
                 )
             return False
 
+	# Set `this_count` when no switch has happened
         if len(self.member_vars["switch_epochs"]) == 0:
             this_count = self.member_vars["num_epochs_run"]
         else:
+	    # Number of epochs since last switch
             this_count = (
                 self.member_vars["num_epochs_run"]
                 - self.member_vars["switch_epochs"][-1]
@@ -2272,8 +2282,8 @@ class PAINeuronModuleTracker:
         self.member_vars["mode"] = "p"
         self.member_vars["current_n_learning_rate_initial_skip_steps"] = 0
 
-        if GPA.pc.get_learn_dendrites_live():
-            self.reset_vals_for_score_reset()
+        # if GPA.pc.get_learn_dendrites_live():
+        #     self.reset_vals_for_score_reset()
 
         self.member_vars["last_max_learning_rate_steps"] = self.member_vars[
             "current_step_count"
@@ -2306,58 +2316,15 @@ class PAINeuronModuleTracker:
         self.reset_vals_for_score_reset()
 
         self.member_vars["current_cycle_lr_max_scores"] = []
-        if GPA.pc.get_learn_dendrites_live():
-            self.member_vars["last_max_learning_rate_steps"] = self.member_vars[
-                "current_step_count"
-            ]
+        # if GPA.pc.get_learn_dendrites_live():
+        #     self.member_vars["last_max_learning_rate_steps"] = self.member_vars[
+        #         "current_step_count"
+        #     ]
         GPA.pai_tracker.member_vars["num_cycles"] += 1
 
         if GPA.pc.get_reset_best_score_on_switch():
             GPA.pai_tracker.member_vars["current_best_validation_score"] = 0
             GPA.pai_tracker.member_vars["running_accuracy"] = 0
-
-    def set_stats_training(self, net):
-        """Start a one epoch stats phase from a converged checkpoint.
-
-        Neuron weights are not stepped and the network is kept in eval mode
-        while the neuron error averages are gathered. After the next
-        add_validation_score the tracker switches directly to dendrite training.
-
-        Parameters
-        ----------
-        net : object
-            The neural network model, the same one passed to add_validation_score.
-
-        Returns
-        -------
-        None
-            This function does not return a value.
-        """
-        self.member_vars["mode"] = "s"
-        net.eval()
-        # Keep eval even if the training loop calls net.train() each epoch
-        net.register_forward_pre_hook(_stats_phase_eval_pre_hook)
-
-    def end_stats_training(self, net):
-        """Remove the stats phase eval hook and return the network to train mode.
-
-        Parameters
-        ----------
-        net : object
-            The neural network model.
-
-        Returns
-        -------
-        None
-            This function does not return a value.
-        """
-        for key in [
-            k
-            for k, hook in net._forward_pre_hooks.items()
-            if hook is _stats_phase_eval_pre_hook
-        ]:
-            del net._forward_pre_hooks[key]
-        net.train()
 
     def start_epoch(self, internal_call=False):
         """Perform steps for when a new training epoch is about to begin.
@@ -2980,7 +2947,7 @@ class PAINeuronModuleTracker:
         # Scores only advance while candidate dendrites are being trained
         if (
             self.member_vars["mode"] != "p"
-            and not GPA.pc.get_learn_dendrites_live()
+            # and not GPA.pc.get_learn_dendrites_live()
         ):
             return {}
 
@@ -3017,7 +2984,7 @@ class PAINeuronModuleTracker:
             return {}
         if (
             self.member_vars["mode"] != "p"
-            and not GPA.pc.get_learn_dendrites_live()
+            # and not GPA.pc.get_learn_dendrites_live()
         ):
             return {}
 
@@ -3558,40 +3525,6 @@ class PAINeuronModuleTracker:
                 - GPA.pai_tracker.member_vars["switch_epochs"][-1]
             )
 
-        # Stats phase is one epoch
-        # Record the checkpoint score as the baseline
-        # Switch to dendrite training with the gathered averages
-        if GPA.pai_tracker.member_vars["mode"] == "s":
-            # Log the stats epoch score as normal
-            # This prevents save_graphs from having an OOB index
-            update_running_accuracy(accuracy, epochs_since_cycle_switch)
-            # End epoch
-            GPA.pai_tracker.stop_epoch(internal_call=True)
-            # Remove the eval-mode hook before saving
-            GPA.pai_tracker.end_stats_training(net)
-            # Bookkeeping
-            GPA.pai_tracker.member_vars["current_best_validation_score"] = accuracy
-            GPA.pai_tracker.member_vars["global_best_validation_score"] = accuracy
-            GPA.pai_tracker.member_vars["epoch_last_improved"] = (
-                GPA.pai_tracker.member_vars["num_epochs_run"]
-            )
-            # Save the model
-	    # `normal_pass_average_d` buffers carry stats through the reload
-            UPA.save_system(net, GPA.pc.get_save_name(), "best_model")
-            # Mode "n" so change_learning_modes takes the n->p path
-            GPA.pai_tracker.member_vars["mode"] = "n"
-            net = UPA.change_learning_modes(
-                net,
-                GPA.pc.get_save_name(),
-                "best_model",
-                GPA.pai_tracker.member_vars["doing_pai"],
-            )
-            # Clear optimizer + Caller rebuilds it
-            GPA.pai_tracker.clear_optimizer_and_scheduler()
-            # Open the first p epoch
-            GPA.pai_tracker.start_epoch(internal_call=True)
-            return net, NETWORK_RESTRUCTURED, False
-
         update_running_accuracy(accuracy, epochs_since_cycle_switch)
         if GPA.pc.get_perforated_backpropagation():
             TPB.update_pb_scores(self)
@@ -3608,10 +3541,12 @@ class PAINeuronModuleTracker:
         # If it is neuron training mode
         if (
             GPA.pai_tracker.member_vars["mode"] == "n"
-            or GPA.pc.get_learn_dendrites_live()
+            # or GPA.pc.get_learn_dendrites_live()
         ):
             check_new_best(net, accuracy, epochs_since_cycle_switch)
-        elif GPA.pc.get_perforated_backpropagation():
+        elif GPA.pc.get_perforated_backpropagation() and (
+            GPA.pai_tracker.member_vars["mode"] == "p"
+        ):
             TPB.check_best_pai_score_improvement()
 
         # Save the latest model
@@ -3640,7 +3575,7 @@ class PAINeuronModuleTracker:
             # If doing neuron training but this dendrite count didn't improve
             if (
                 (GPA.pai_tracker.member_vars["mode"] == "n")
-                or GPA.pc.get_learn_dendrites_live()
+                # or GPA.pc.get_learn_dendrites_live()
             ) and (GPA.pai_tracker.member_vars["current_n_set_global_best"] is False):
                 new_restructuring_status_value, net = process_no_improvement(net)
                 # if this was the final try return that training is complete
@@ -3714,6 +3649,14 @@ class PAINeuronModuleTracker:
                             ],
                         )
                     return net, True, True
+
+                # Stats ends + weights were frozen so this score is the
+                # baseline the first dendrites must beat
+                if GPA.pai_tracker.member_vars["mode"] == "s":
+                    GPA.pai_tracker.member_vars["current_best_validation_score"] = accuracy
+                    GPA.pai_tracker.member_vars["global_best_validation_score"] = accuracy
+                    # Saved so a failed first set of dendrites has a model to reload
+                    UPA.save_system(net, GPA.pc.get_save_name(), "best_model")
 
                 # Otherwise if its neuron training mode reset the counter of failed dendrites
                 # Check if we should increment integrated count BEFORE change_learning_modes loads old state
@@ -3804,7 +3747,11 @@ class PAINeuronModuleTracker:
             )
 
         # If not time to switch and you have a scheduler, perform the update step
-        elif GPA.pai_tracker.member_vars["scheduler"] is not None:
+        # Skipped during the stats phase since nothing is being learned
+        elif (
+            GPA.pai_tracker.member_vars["scheduler"] is not None
+            and GPA.pai_tracker.member_vars["mode"] != "s"
+        ):
             new_restructuring_status_value, net = process_scheduler_update(
                 net, accuracy, epochs_since_cycle_switch
             )

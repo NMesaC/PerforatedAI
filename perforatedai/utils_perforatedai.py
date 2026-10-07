@@ -1124,7 +1124,9 @@ def load_pretrained_model(
     # Keeping pretrained architecture/weights while zeroing cycle counters avoids
     # stale dendrite bookkeeping referencing empty score buffers.
     GPA.pai_tracker.reset_module_vector(net, load_from_restart=True)
-    GPA.pai_tracker.member_vars["mode"] = "n"
+    GPA.pai_tracker.member_vars["mode"] = (
+        "s" if GPA.pc.get_start_in_stats_phase() else "n"
+    )
     GPA.pai_tracker.member_vars["num_dendrites_added"] = 0
     GPA.pai_tracker.member_vars["num_dendrites_integrated"] = 0
     GPA.pai_tracker.member_vars["num_cycles"] = 0
@@ -2032,7 +2034,8 @@ def change_learning_modes(net, folder, name, doing_pai):
         ][-1]
         GPA.pai_tracker.reset_vals_for_score_reset()
         return net
-    if GPA.pai_tracker.member_vars["mode"] == "n":
+    # Stats phase only happens at the start and switches to p the same way n does
+    if GPA.pai_tracker.member_vars["mode"] in ("n", "s"):
         current_epoch = GPA.pai_tracker.member_vars["num_epochs_run"]
         overwritten_epochs = GPA.pai_tracker.member_vars["overwritten_epochs"]
         overwritten_extra = GPA.pai_tracker.member_vars["extra_scores"]
@@ -2045,9 +2048,14 @@ def change_learning_modes(net, folder, name, doing_pai):
         because it will delete dendrites if the previous best was better than
         the current best
         """
-        if not GPA.pc.get_silent():
-            print("Importing best Model for switch to PA...")
-        net = load_system(net, folder, name, switch_call=True)
+        if GPA.pai_tracker.member_vars["mode"] == "s":
+            # Weights did not change during the stats phase so there is nothing to load
+            # NOTE: In open source the stats phase does nothing, no error is gathered
+            net.train()
+        else:
+            if not GPA.pc.get_silent():
+                print("Importing best Model for switch to PA...")
+            net = load_system(net, folder, name, switch_call=True)
         GPA.pai_tracker.set_dendrite_training()
         GPA.pai_tracker.member_vars["overwritten_epochs"] = overwritten_epochs
         GPA.pai_tracker.member_vars["overwritten_epochs"] += (
@@ -2122,9 +2130,8 @@ def change_learning_modes(net, folder, name, doing_pai):
             "switch_epochs"
         ][-1]
         # Will be false for open source implementation
-        if GPA.pc.get_retain_all_dendrites() or (
-            GPA.pc.get_learn_dendrites_live() and set_best
-        ):
+        if GPA.pc.get_retain_all_dendrites():
+            # or (GPA.pc.get_learn_dendrites_live() and set_best)
             if not GPA.pc.get_silent():
                 print(
                     "Saving model before starting normal training to "
