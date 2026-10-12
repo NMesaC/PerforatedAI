@@ -88,10 +88,16 @@ def add_pai_config_var_functions(obj, var_name, initial_value, list_type=False):
         """
         global pai_tracker
         if type(getattr(self, private_name)) is list:
+            # Ensure pai_tracker has a default value before perforate_model is called
+            # The TUI shows <unavailable> for num_dendrites added before perforate_model without this
+            if isinstance(pai_tracker, list):
+                num_dendrites_added = 0
+            else:
+                num_dendrites_added = pai_tracker.member_vars["num_dendrites_added"]
             return getattr(self, private_name)[
                 min(
                     len(getattr(self, private_name)) - 1,
-                    pai_tracker.member_vars["num_dendrites_added"],
+                    num_dendrites_added,
                 )
             ]
         return getattr(self, private_name)
@@ -357,8 +363,6 @@ class PAIConfig:
         Current switch mode setting.
     reset_best_score_on_switch : bool
         Whether to reset best score when adding dendrites.
-    learn_dendrites_live : bool
-        Not implemented, all code using it is commented out.
     no_extra_n_modes : bool
         Disable extra neuron modes (advanced feature).
     d_type : torch.dtype
@@ -437,7 +441,6 @@ class PAIConfig:
                 "test_saves",
                 "pai_saves",
                 "reset_best_score_on_switch",
-                "learn_dendrites_live",
                 "no_extra_n_modes",
                 "start_in_stats_phase",
                 "retain_all_dendrites",
@@ -594,6 +597,19 @@ class PAIConfig:
         None or raises AttributeError
             Returns None for missing set_ methods, raises AttributeError otherwise.
         """
+        # PB on  -> All settings exist, so an unknown set_/append_ name is a typo -> Raise an Error
+        # PB off -> Keep no-op functionality PB scripts still run in open source
+        if name.startswith("set_") or name.startswith("append_"):
+            global_pc = globals().get("pc")
+            pb_on = bool(
+                (global_pc if global_pc is not None else self).__dict__.get(
+                    "_perforated_backpropagation", False
+                )
+            )
+            if pb_on:
+                raise AttributeError(
+                    f"PAIConfig has no setting '{name.split('_', 1)[1]}' ({name})"
+                )
         if name.startswith("set_"):
             print(f"Variable '{name[4:]}' does not exist.  Ignoring set attempt.")
             return lambda x: None
@@ -813,12 +829,6 @@ class PAIConfig:
             )
 
             # Advanced settings
-            # Not implemented, all code using it is commented out.  Kept so
-            # existing set_learn_dendrites_live calls do not break
-            self.learn_dendrites_live = False
-            add_pai_config_var_functions(
-                self, "learn_dendrites_live", self.learn_dendrites_live
-            )
             self.no_extra_n_modes = True
             add_pai_config_var_functions(
                 self, "no_extra_n_modes", self.no_extra_n_modes
@@ -1048,53 +1058,56 @@ class PAIConfig:
             add_pai_config_var_functions(
                 self, "output_dimensions", self.output_dimensions, list_type=True
             )
-        # Verbosity settings
-        self.verbose = False
-        add_pai_config_var_functions(self, "verbose", self.verbose)
-        self.extra_verbose = False
-        add_pai_config_var_functions(self, "extra_verbose", self.extra_verbose)
-        # Suppress all PAI prints
-        self.silent = False
-        add_pai_config_var_functions(self, "silent", self.silent)
+        # Only the global config sets these, so per-module configs fall back to GPA.pc for them
+        # Before, each module_config had its own copy (e.g. verbose was always False)
+        if not module_name:
+            # Verbosity settings
+            self.verbose = False
+            add_pai_config_var_functions(self, "verbose", self.verbose)
+            self.extra_verbose = False
+            add_pai_config_var_functions(self, "extra_verbose", self.extra_verbose)
+            # Suppress all PAI prints
+            self.silent = False
+            add_pai_config_var_functions(self, "silent", self.silent)
 
-        # In place for future implementation options of adding multiple candidate
-        # dendrites together
-        self.global_candidates = 1
-        add_pai_config_var_functions(self, "global_candidates", self.global_candidates)
+            # In place for future implementation options of adding multiple candidate
+            # dendrites together
+            self.global_candidates = 1
+            add_pai_config_var_functions(self, "global_candidates", self.global_candidates)
 
-        # Weight initialization settings
-        # Multiplier when randomizing dendrite weights
-        self.candidate_weight_initialization_multiplier = 0.01
-        add_pai_config_var_functions(
-            self,
-            "candidate_weight_initialization_multiplier",
-            self.candidate_weight_initialization_multiplier,
-        )
-        # Multiplier when randomizing dendrite weights
-        self.candidate_weight_init_by_main = False
-        add_pai_config_var_functions(
-            self,
-            "candidate_weight_init_by_main",
-            self.candidate_weight_init_by_main,
-        )
+            # Weight initialization settings
+            # Multiplier when randomizing dendrite weights
+            self.candidate_weight_initialization_multiplier = 0.01
+            add_pai_config_var_functions(
+                self,
+                "candidate_weight_initialization_multiplier",
+                self.candidate_weight_initialization_multiplier,
+            )
+            # Multiplier when randomizing dendrite weights
+            self.candidate_weight_init_by_main = False
+            add_pai_config_var_functions(
+                self,
+                "candidate_weight_init_by_main",
+                self.candidate_weight_init_by_main,
+            )
 
-        # Dendrite retention settings
-        # A setting to keep dendrites even if they do not improve scores
-        self.retain_all_dendrites = False
-        add_pai_config_var_functions(
-            self, "retain_all_dendrites", self.retain_all_dendrites
-        )
+            # Dendrite retention settings
+            # A setting to keep dendrites even if they do not improve scores
+            self.retain_all_dendrites = False
+            add_pai_config_var_functions(
+                self, "retain_all_dendrites", self.retain_all_dendrites
+            )
 
-        # Max dendrites to add even if they do continue improving scores
-        self.max_dendrites = 100
-        add_pai_config_var_functions(self, "max_dendrites", self.max_dendrites)
+            # Max dendrites to add even if they do continue improving scores
+            self.max_dendrites = 100
+            add_pai_config_var_functions(self, "max_dendrites", self.max_dendrites)
 
-        # Activation function settings
-        # The activation function to use for dendrites
-        self.pai_forward_function = torch.sigmoid
-        add_pai_config_var_functions(
-            self, "pai_forward_function", self.pai_forward_function
-        )
+            # Activation function settings
+            # The activation function to use for dendrites
+            self.pai_forward_function = torch.sigmoid
+            add_pai_config_var_functions(
+                self, "pai_forward_function", self.pai_forward_function
+            )
 
         # Apply per-module overrides after defaults are defined so loaded values
         # win over initializer defaults.
@@ -1126,6 +1139,12 @@ class PAIConfig:
         # _config_file stays None until save_name is set to a non-empty value
 
     # ------------------------------------------------------------------
+
+    # `hasattr(pc, "set_x")` is always True because of `__getattr__`
+    # This function actually checks if a setting exists
+    def has_setting(self, name):
+        """Return True if ``name`` is a real configuration setting on this object."""
+        return f"_{name}" in self.__dict__
 
     def save_config(self, filename):
         """Save the current PAIConfig state to a JSON file.
@@ -1229,7 +1248,14 @@ class PAIConfig:
             json.dump(config_dict, f, indent=2)
         print(f"[PAI Config] Saved {len(config_dict)} variables \u2192 {filename}")
 
-    def load_config(self, filename, module_name=None, module_type=None, skip_keys=None):
+    def load_config(
+        self,
+        filename,
+        module_name=None,
+        module_type=None,
+        skip_keys=None,
+        report_changes=False,
+    ):
         """Load PAIConfig state from a JSON file produced by :py:meth:`save_config`.
 
         If *module_name* is ``None`` (default) every serialisable variable in
@@ -1251,6 +1277,8 @@ class PAIConfig:
 
         skip_keys : set, optional
             Variable names to ignore while loading (manual overrides).
+        report_changes : bool, optional
+            Print the names and values that the file changes.
 
         Returns
         -------
@@ -1308,6 +1336,7 @@ class PAIConfig:
         skip_keys = set(skip_keys or [])
         loaded = 0
         skipped = 0
+        changed = []
         self.__dict__["_loading_config_values"] = True
         try:
             for key, json_val in config_dict.items():
@@ -1327,15 +1356,17 @@ class PAIConfig:
                 private_key = f"_{key}"
                 if hasattr(self, private_key):
                     try:
-                        setattr(
-                            self,
-                            private_key,
-                            (
-                                _deserialize_pai_value(json_val, type_hint)
-                                if type_hint is not None
-                                else json_val
-                            ),
+                        new_value = (
+                            _deserialize_pai_value(json_val, type_hint)
+                            if type_hint is not None
+                            else json_val
                         )
+                        # Collect values the file changes so they can be printed
+                        if report_changes and _serialize_pai_value(
+                            getattr(self, private_key)
+                        ) != _serialize_pai_value(new_value):
+                            changed.append(f"{key}={_serialize_pai_value(new_value)}")
+                        setattr(self, private_key, new_value)
                         loaded += 1
                     except Exception as exc:
                         print(f"[PAI Config] Warning: could not load '{key}': {exc}")
@@ -1353,6 +1384,12 @@ class PAIConfig:
             f"[PAI Config] Loaded {loaded} variables from {filename}"
             + (f" ({skipped} skipped)" if skipped else "")
         )
+        # Print values that an earlier run with the same save_name changes
+        if changed:
+            print(
+                f"[PAI Config] {filename} changed {len(changed)} values from earlier "
+                f"settings: " + ", ".join(changed)
+            )
 
     def get_run_config_path(self):
         """Get the run-specific config path derived from save_name.
@@ -1390,7 +1427,13 @@ class PAIConfig:
         if config_file and os.path.exists(config_file):
             self.load_config(config_file, skip_keys=skip_keys)
         if run_config and os.path.exists(run_config):
-            self.load_config(run_config, skip_keys=skip_keys)
+            # An earlier run with the same save_name can change settings here, so print what changes
+            # Skip device and use_cuda
+            self.load_config(
+                run_config,
+                skip_keys=set(skip_keys) | {"device", "use_cuda"},
+                report_changes=True,
+            )
 
     def persist_config_outputs(self, overwrite_config_file=False):
         """Persist current config state to local JSON outputs.

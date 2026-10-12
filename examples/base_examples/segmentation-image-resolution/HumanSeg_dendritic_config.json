@@ -26,7 +26,6 @@
   ],
   "improvement_threshold_raw": 1e-05,
   "initial_history_after_switches": 0,
-  "learn_dendrites_live": false,
   "library_extra_scores": [],
   "library_extra_scores_without_graphing": [],
   "library_validation_score": "",

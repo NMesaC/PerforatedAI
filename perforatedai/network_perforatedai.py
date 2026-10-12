@@ -168,8 +168,10 @@ def load_pai_model_from_dict(net, state_dict):
             module.simulate_cycles(num_cycles, nodeCount)
         if not module.processor is None:
             processor = copy.deepcopy(module.processor)
-            processor.pre = module.processor.post_n1
-            processor.post = module.processor.post_n2
+            # Pre/Post were bound to the original module.processor, not the copy
+            # Bind to the copy so each layer keeps its own state.
+            processor.pre = processor.post_n1
+            processor.post = processor.post_n2
             module.processor_array.append(processor)
         else:
             module.processor_array.append(None)
@@ -265,12 +267,14 @@ class PerforatedModule(nn.Module):
         None
             This function does not return a value.
         """
-        for i in range(0, num_cycles, 2):
+        # Round down so an odd num_cycles (saved in p phase) has num_cycles // 2 dendrites
+        for i in range(num_cycles // 2):
             self.layer_array.append(copy.deepcopy(self.layer_array[0]))
             if not self.processor is None:
                 processor = copy.deepcopy(self.processor)
-                processor.pre = self.processor.pre_d
-                processor.post = self.processor.post_d
+                # Bind pre/post to this copy, not to the shared self.processor
+                processor.pre = processor.pre_d
+                processor.post = processor.post_d
                 self.processor_array.append(processor)
             else:
                 self.processor_array.append(None)
@@ -295,7 +299,8 @@ class PerforatedModule(nn.Module):
         dendrite_outs = args2[1]
         args2 = args2[2:]
         if self.processor_array[c] != None:
-            out_values = self.processor_array[c].pre(*args2, **kwargs2)
+            # Feed the pre output to the layer, as in training
+            args2, kwargs2 = self.processor_array[c].pre(*args2, **kwargs2)
         out_values = self.layer_array[c](*args2, **kwargs2)
         if self.processor_array[c] != None:
             out = self.processor_array[c].post(out_values)

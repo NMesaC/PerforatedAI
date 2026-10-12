@@ -205,6 +205,14 @@ def filter_backward(grad_out, values, module=None):
         # even when _fb_init_done resets to False in a fresh process.
         already_init = (module is not None and module._fb_init_done) or \
                        values[0].current_d_init.item()
+        # After a checkpoint load current_d_init is 1 but _fb_init_done is False
+        # Set the flag here so forward stops adding this hook on every batch
+        # (Saves time during training)
+        if already_init and module is not None and not module._fb_init_done:
+            module._fb_init_done = True
+            if not GPA.pc.get_perforated_backpropagation() and module._fb_hook_handle is not None:
+                module._fb_hook_handle.remove()
+                module._fb_hook_handle = None
         if not already_init:
             # If input dimensions and gradient don't have same shape trigger error and quit
             if len(values[0].this_output_dimensions) != len(grad_out.shape):
@@ -424,8 +432,6 @@ class PAINeuronModule(nn.Module):
         # Values for dendrite to neuron weights
         self.dendrites_to_top = nn.ParameterList()
         self.register_parameter("newest_dendrite_to_top", None)
-        self.candidate_to_top = nn.ParameterList()
-        self.register_parameter("current_candidate_to_top", None)
         # Create the dendrite module
         self.dendrite_module = PAIDendriteModule(
             self.main_module,
@@ -569,7 +575,6 @@ class PAINeuronModule(nn.Module):
         create_dendrite_fn = self.dendrite_module._create_dendrite_fn
         self.dendrite_modules_added = 0
         self.dendrites_to_top = nn.ParameterList()
-        self.candidate_to_top = nn.ParameterList()
         self.dendrite_module = PAIDendriteModule(
             self.main_module,
             activation_function_value=self.activation_function_value,
@@ -684,19 +689,6 @@ class PAINeuronModule(nn.Module):
             self.dendrite_module.set_mode(mode)
             # Initialize the dendrite to neuron connections
             if self.dendrite_modules_added > 0:
-                # if self.module_config.get_learn_dendrites_live():
-                #     values = torch.cat(
-                #         (
-                #             self.dendrites_to_top[self.dendrite_modules_added - 1],
-                #             nn.Parameter(
-                #                 self.candidate_to_top.detach()
-                #                 .clone()
-                #                 .to(dtype=self.module_config.get_d_type())
-                #             ),
-                #         ),
-                #         0,
-                #     )
-                # else:
                 values = torch.cat(
                     (
                         self.dendrites_to_top[self.dendrite_modules_added - 1],
@@ -729,19 +721,6 @@ class PAINeuronModule(nn.Module):
                     )
                 )
             else:
-                # if self.module_config.get_learn_dendrites_live():
-                #     # Freeze previous entry before appending new one.
-                #     if len(self.dendrites_to_top) > 0:
-                #         self.dendrites_to_top[-1].requires_grad_(False)
-                #     self.dendrites_to_top.append(
-                #         nn.Parameter(
-                #             self.candidate_to_top.detach()
-                #             .clone()
-                #             .to(dtype=self.module_config.get_d_type()),
-                #             requires_grad=True,
-                #         )
-                #     )
-                # else:
                 # Freeze previous entry before appending new one.
                 if len(self.dendrites_to_top) > 0:
                     self.dendrites_to_top[-1].requires_grad_(False)
@@ -882,12 +861,6 @@ class PAINeuronModule(nn.Module):
                         + list(dendrite_outs[i].size())[self.this_node_index + 1 :]
                     )
                 out = out + (dendrite_outs[i].to(out.device) * to_top.to(out.device))
-
-        # If learning live, add the candidate's output to the neuron's output via the live weight
-        # if self.module_config.get_perforated_backpropagation():
-        #     out = MPB.apply_live_candidate_to_output(
-        #         self, out, candidate_nonlinear_outs
-        #     )
 
         # Catch if processors are required
         if type(out) is tuple:
@@ -1536,6 +1509,12 @@ class PAIDendriteModule(nn.Module):
         for c in range(0, self.num_dendrites):
             if GPA.pc.get_perforated_backpropagation():
                 args2, kwargs2 = MPB.preprocess_pb(*args, **kwargs)
+            # Without PB, args2 is set once before the loop
+            # This causes dendrite c to get the pre_dendrite output of dendrite c-1
+            # (Meaning it doesn't get the module input)
+            # The cleaned model resets the input for each dendrite, so replicate that here
+            else:
+                args2, kwargs2 = args, kwargs
             if self.processors != []:
                 try:
                     args2, kwargs2 = self.processors[c].pre_d(*args2, **kwargs2)

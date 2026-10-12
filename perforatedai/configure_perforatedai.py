@@ -712,7 +712,14 @@ def get_global_setting_value(setting_name):
 
 def apply_setting_value(setting_name, value):
     """Apply one setting value through a setter when available."""
-    setter = getattr(GPA.pc, f"set_{setting_name}", None)
+    # Check the setting exists first
+    # If the setting doesn't exist, setter becomes a no-op and prints
+    # the message correctly
+    setter = (
+        getattr(GPA.pc, f"set_{setting_name}", None)
+        if GPA.pc.has_setting(setting_name)
+        else None
+    )
     if setter is not None:
         setter(value)
         return True, ""

@@ -154,6 +154,7 @@ def perforate_model(
         making_graphs=making_graphs,
         maximizing_score=maximizing_score,
         num_classes=num_classes,
+        # NICO: Why is this negated? values_per_val_epoch is not
         values_per_train_epoch=-values_per_train_epoch,
         values_per_val_epoch=values_per_val_epoch,
         zooming_graph=zooming_graph,
@@ -920,8 +921,8 @@ def string_to_tensor(string):
         The converted tensor.
 
     """
-    ords = list(map(ord, string))
-    ords = torch.tensor(ords, dtype=torch.uint8)
+    # Store the characters as UTF-8 bytes to prevent overflow on chars above code 255
+    ords = torch.tensor(list(string.encode("utf-8")), dtype=torch.uint8)
     return ords
 
 
@@ -939,16 +940,27 @@ def string_from_tensor(string_tensor):
         The converted string.
 
     """
-    ords = string_tensor.tolist()
-    to_return = ""
-    # Doing block processing like this helps with memory errors
-    while len(ords) != 0:
-        remaining_ords = ords[100000:]
-        ords = ords[:100000]
-        to_append = "".join(map(chr, ords))
-        to_return = to_return + to_append
-        ords = remaining_ords
-    return to_return
+    # Decode UTF-8 bytes
+    raw = bytes(string_tensor.tolist())
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+# Match the module or its children only
+def is_not_saved_name(name, not_save_names):
+    """Return True if ``name`` is a module in ``not_save_names`` or inside one.
+
+    Both values may start with "." (module ids) or not (state_dict keys);
+    the leading "." is ignored.
+    """
+    name = name.lstrip(".")
+    for ns in not_save_names:
+        ns = ns.lstrip(".")
+        if name == ns or name.startswith(ns + "."):
+            return True
+    return False
 
 
 def save_system(net, folder, name):
@@ -972,7 +984,6 @@ def save_system(net, folder, name):
     """
     if GPA.pc.get_verbose():
         print("saving system %s" % name)
-    temp = string_to_tensor(GPA.pai_tracker.to_string())
     if hasattr(net, "tracker_string"):
         net.tracker_string = string_to_tensor(GPA.pai_tracker.to_string()).to(
             next(net.parameters()).device
@@ -1216,7 +1227,7 @@ def load_pretrained_model(
         
         net = BPA.blockwise_network(net)
         net = CPA.refresh_net(net)
-        
+
         if GPA.pc.get_verbose():
             print("Dendrite scaffolding removed. Model ready for inference or finetuning.")
     
@@ -1363,56 +1374,13 @@ def save_net(net, folder, name):
             save_model_with_weight_tying(net, save_point + name + ".pt")
         else:
             # Strip the . so that the naming is the same for everywhere but it works with state_dict naming
-            not_save = [ns.lstrip('.') for ns in GPA.pc.get_module_names_to_not_save()]
+            # Match whole module names, not raw prefixes
+            not_save = GPA.pc.get_module_names_to_not_save()
             state_dict = {k: v for k, v in net.state_dict().items()
-                          if not any(k.startswith(ns) for ns in not_save)}
+                          if not is_not_saved_name(k, not_save)}
             save_file(state_dict, save_point + name + ".pt")
     else:
         torch.save(net, save_point + name + ".pt")
-
-
-def save_pai_net(net, folder, name):
-    """Save the final pai network
-
-    This can be called after training to save the final network
-    with all scaffolding removed so only the refined weights remain
-
-    Parameters
-    ----------
-    net : nn.Module
-        The network to save.
-    folder : str
-        The folder to save the network in.
-    name : str
-        The name to save the network under.
-
-    Returns
-    -------
-    None
-
-    """
-    # if running a DDP only save with first thread
-    if "RANK" in os.environ:
-        if int(os.environ["RANK"]) != 0:
-            return
-
-    # print('calling save: %s' % name)
-    # GPA.pai_tracker.archive_layer()
-    # These deep copys are required or the real model will also have its layers replaced
-    net = prepare_final_model(net)
-    if not os.path.isdir(folder):
-        os.makedirs(folder)
-    save_point = folder + "/"
-    if not os.path.isdir(save_point):
-        os.mkdir(save_point)
-
-    if GPA.pc.get_using_safe_tensors():
-        if GPA.pc.get_weight_tying_experimental():
-            save_model_with_weight_tying(net, save_point + name + "_pai.pt")
-        else:
-            save_file(net.state_dict(), save_point + name + "_pai.pt")
-    else:
-        torch.save(net, save_point + name + "_pai.pt")
 
 
 def save_pai_net(net, folder, name):
@@ -1479,9 +1447,10 @@ def manual_load_state_dict(model, state_dict):
         This function does not return a value.
     """
     own_state = model.state_dict()
-    not_save = [ns.lstrip('.') for ns in GPA.pc.get_module_names_to_not_save()]
+    # Match whole module names, not raw prefixes
+    not_save = GPA.pc.get_module_names_to_not_save()
     for name, param in state_dict.items():
-        if any(name.startswith(ns) for ns in not_save):
+        if is_not_saved_name(name, not_save):
             print("skipping loading %s based on module_names_to_not_save" % name)
             continue
         if name not in own_state:
@@ -1601,8 +1570,9 @@ def get_module_base_name(module):
         module_name = module_name[1:]
     # If it was a dataparallel it will also have a module at the start
     # so strip that for loading
-    if module_name[:6] == "module":
-        module_name = module_name[7:]
+    # Strip only "module.", so "module_list.0" stays "module_list.0"
+    if module_name.startswith("module."):
+        module_name = module_name[len("module."):]
     return module_name
 
 
@@ -1648,7 +1618,8 @@ def load_net_from_dict(net, state_dict):
         )
     not_save = GPA.pc.get_module_names_to_not_save()
     for module in pai_modules:
-        if any(module.name.startswith(ns) for ns in not_save):
+        # Match whole module names, not raw prefixes
+        if is_not_saved_name(module.name, not_save):
             print("skipping loading %s based on module_names_to_not_save" % module.name)
             continue
         # Set up name to be what will be saved in the state dict
@@ -1744,7 +1715,6 @@ There are many reasons this can happen:
         net.register_buffer("tracker_string", state_dict[tracker_key])
     try:
         load_result = net.load_state_dict(state_dict, strict=False)
-        not_save_state_names = [ns.lstrip('.') for ns in not_save]
 
         def is_ignored_key(key):
             """Check whether a state-dict key should be ignored.
@@ -1759,7 +1729,8 @@ There are many reasons this can happen:
             bool
                 ``True`` when key belongs to a not-saved namespace.
             """
-            return any(key.startswith(ns) for ns in not_save_state_names)
+            # Match whole module names, not raw prefixes
+            return is_not_saved_name(key, not_save)
 
         missing_keys = [key for key in load_result.missing_keys if not is_ignored_key(key)]
         unexpected_keys = [key for key in load_result.unexpected_keys if not is_ignored_key(key)]
@@ -1775,10 +1746,11 @@ There are many reasons this can happen:
         PyTorch can have trouble loading state dicts even when they are correct.
         This is a workaround to manually load the state dict if this happens.
         """
+        # Match whole module names, not raw prefixes
         filtered_net_keys = {
             key
             for key in net.state_dict().keys()
-            if not any(key.startswith(ns.lstrip('.')) for ns in not_save)
+            if not is_not_saved_name(key, not_save)
         }
         if filtered_net_keys == set(state_dict.keys()):
             print("Attempting manual loading of state_dict")
@@ -1989,9 +1961,26 @@ def count_params(net):
     """
     if GPA.pc.get_perforated_backpropagation():
         return UPB.pb_count_params(net)
+    # Skip parameters the final model drops, to match prepare_final_model
+    excluded = set()
+    for module in get_pai_modules(net, 0):
+        for old_to_top in list(module.dendrites_to_top)[:-1]:
+            excluded.add(id(old_to_top))
+        dendrite_module = module.dendrite_module
+        for scaffold_name in (
+            "dendrites_to_candidates",
+            "candidate_module",
+            "best_candidate_module",
+        ):
+            scaffold = getattr(dendrite_module, scaffold_name, None)
+            if scaffold is not None:
+                for p in scaffold.parameters():
+                    excluded.add(id(p))
     parameters = net.named_parameters()
     unique_params = {
-        p.data_ptr(): p for name, p in parameters if "parent_module" not in name
+        p.data_ptr(): p
+        for name, p in parameters
+        if "parent_module" not in name and id(p) not in excluded
     }.values()
     return sum(p.numel() for p in unique_params)
 
@@ -2106,7 +2095,6 @@ def change_learning_modes(net, folder, name, doing_pai):
     else:
         if not GPA.pc.get_silent():
             print("Switching back to N...")
-        set_best = GPA.pai_tracker.member_vars["current_n_set_global_best"]
         GPA.pai_tracker.set_neuron_training()
         if len(GPA.pai_tracker.member_vars["p_switch_epochs"]) == 0:
             GPA.pai_tracker.member_vars["p_switch_epochs"].append(
@@ -2131,7 +2119,6 @@ def change_learning_modes(net, folder, name, doing_pai):
         ][-1]
         # Will be false for open source implementation
         if GPA.pc.get_retain_all_dendrites():
-            # or (GPA.pc.get_learn_dendrites_live() and set_best)
             if not GPA.pc.get_silent():
                 print(
                     "Saving model before starting normal training to "
@@ -2563,16 +2550,35 @@ def set_gpa_config(config):
     # Extract type information
     config_types = config.get("_types", {})
 
+    # Settings tied to the uploading machine, not the model
+    machine_keys = {
+        "device",
+        "use_cuda",
+        "save_name",
+        "config_file",
+        "perforated_backpropagation",
+    }
+
+
     for key, value in config.items():
         # Skip the types metadata
         if key == "_types":
+            continue
+
+        # Do not restore machine-specific values
+        if key in machine_keys:
+            skip_count += 1
+            if GPA.pc.get_verbose():
+                print(f"Not restoring machine-specific setting {key}")
             continue
 
         # Construct the set method name
         set_method_name = f"set_{key}"
 
         # Check if the set method exists
-        if hasattr(GPA.pc, set_method_name):
+        # `hasattr` is always True because of __getattr__, so use has_setting
+        setting_exists = GPA.pc.has_setting(key)
+        if setting_exists:
             try:
                 method = getattr(GPA.pc, set_method_name)
                 if callable(method):

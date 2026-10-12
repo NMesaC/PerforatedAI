@@ -50,13 +50,22 @@ class PAILayer(nn.Module):
 
         self.processor_array = processor_array
         if dendrites_to_dendrites:
-            self.skip_weights = dendrites_to_dendrites
+            # Explicitly make a new list for `skip_weights`
+            # `skip_weights = dendrites_to_dendrites` just created an alias
+            # So this append also changed `dendrites_to_dendrites`
+            # Avoid with an explicit copy
+            self.skip_weights = nn.ParameterList(list(dendrites_to_dendrites))
         else:
             """
             This will only be the case if there is less than 2 dendrites, in these cases an empty array
             should still be added so that dendrites_to_top is included at the correct index
             """
-            self.skip_weights = nn.ParameterList()
+            # With 1 dendrite, `dendrites_to_dendrites` is empty and has no index 0
+            # This meant `dendrites_to_top` went to index 0 
+            # refresh_net then removed it as a placeholder and the final model lost the dendrite
+            # Add the same empty placeholder that PAIDendriteModule.set_mode uses
+            # NOTE: This was only an issue for fns that build a clean model 
+            self.skip_weights = nn.ParameterList([torch.tensor([])])
         if dendrites_to_top:
             self.skip_weights.append(dendrites_to_top[len(dendrites_to_top) - 1])
         else:

@@ -179,7 +179,9 @@ def check_input_problems(net, accuracy):
         pdb.set_trace()
         sys.exit(-1)
 
-    if "module" in net.__dir__():
+    # Check the wrapper type, not just a .module attribute
+    wrapper_types = (nn.DataParallel, nn.parallel.DistributedDataParallel)
+    if isinstance(net, wrapper_types) or type(net).__name__ == "FullyShardedDataParallel":
         _pai_log("error", "Need to call .module when using add validation score")
         pdb.set_trace()
         sys.exit(-1)
@@ -213,8 +215,20 @@ def update_running_accuracy(accuracy, epochs_since_cycle_switch):
 
     """
     # Only update running_accuracy when neurons are being updated
-    if GPA.pai_tracker.member_vars["mode"] == "n":  # or GPA.pc.get_learn_dendrites_live()
-        if epochs_since_cycle_switch < GPA.pc.get_initial_history_after_switches():
+    if GPA.pai_tracker.member_vars["mode"] == "n":
+        # Seed the running average with the first score of each cycle
+        # Without this, minimization tasks couldn't beat the artificially low first running score
+        if len(GPA.pai_tracker.member_vars["switch_epochs"]) == 0:
+            scores_before_this_one = epochs_since_cycle_switch
+        else:
+            scores_before_this_one = epochs_since_cycle_switch - 1
+        running_was_reset = (
+            len(GPA.pai_tracker.member_vars["switch_epochs"]) == 0
+            or GPA.pc.get_reset_best_score_on_switch()
+        )
+        if scores_before_this_one <= 0 and running_was_reset:
+            GPA.pai_tracker.member_vars["running_accuracy"] = accuracy
+        elif epochs_since_cycle_switch < GPA.pc.get_initial_history_after_switches():
             if epochs_since_cycle_switch <= 0:
                 GPA.pai_tracker.member_vars["running_accuracy"] = accuracy
             else:
@@ -241,7 +255,6 @@ def update_running_accuracy(accuracy, epochs_since_cycle_switch):
     if (
         GPA.pc.get_drawing_pai()
         or GPA.pai_tracker.member_vars["mode"] == "n"
-        # or GPA.pc.get_learn_dendrites_live()
     ):
         GPA.pai_tracker.member_vars["running_accuracies"].append(
             GPA.pai_tracker.member_vars["running_accuracy"]
@@ -268,6 +281,7 @@ def score_beats_current_best(new_score, old_score):
     Must beat the old score by the margins set in globals for improvement thresholds.
 
     """
+    # NICO: Why don't we use abs(new_score) here?
     return (
         GPA.pai_tracker.member_vars["maximizing_score"]
         and (new_score * (1.0 - GPA.pc.get_improvement_threshold()) > old_score)
@@ -700,7 +714,6 @@ def process_scheduler_update(net, accuracy, epochs_since_cycle_switch):
         # If potentially might have higher accuracy
         (
             (GPA.pai_tracker.member_vars["mode"] == "n")
-            # or GPA.pc.get_learn_dendrites_live()
         )
         and
         # And learning rate just stepped
@@ -1714,6 +1727,9 @@ class PAINeuronModuleTracker:
 
         current_steps = 0
         current_ticker = 0
+        # Stop if the learning rate stops changing
+        calls_without_change = 0
+        max_calls_without_change = 10000
 
         for param_group in GPA.pai_tracker.member_vars[
             "optimizer_instance"
@@ -1724,7 +1740,25 @@ class PAINeuronModuleTracker:
             print("Using scheduler:")
             print(type(self.member_vars["scheduler_instance"]))
 
+        # Drop the plateau learning rate directly
+        # (Cleaner method of searching for the learning rate)
+        if (
+            type(self.member_vars["scheduler_instance"])
+            is torch.optim.lr_scheduler.ReduceLROnPlateau
+            and mode == "step_learning_rate"
+        ):
+            return self.reduce_plateau_learning_rate(num_ticks)
+
         while current_ticker < num_ticks:
+            # Add a warning for the case where lr can't change further
+            if calls_without_change >= max_calls_without_change:
+                _pai_log(
+                    "warning",
+                    f"Scheduler learning rate did not change after "
+                    f"{max_calls_without_change} steps (min_lr reached?). "
+                    f"Stopping after {current_steps} of {num_ticks} learning rate steps.",
+                )
+                break
             if GPA.pc.get_verbose():
                 print(
                     f"Lower start rate initial {learning_rate1} "
@@ -1735,17 +1769,10 @@ class PAINeuronModuleTracker:
                 type(self.member_vars["scheduler_instance"])
                 is torch.optim.lr_scheduler.ReduceLROnPlateau
             ):
-                if mode == "step_learning_rate":
-                    # Step with counter as last improved accuracy
+                # Rebuild scheduler state with the past validation scores 
+                if mode == "increment_epoch_count":
                     self.member_vars["scheduler_instance"].step(
-                        metrics=self.member_vars["last_improved_accuracies"][
-                            GPA.pai_tracker.steps_after_switch() - 1
-                        ]
-                    )
-                elif mode == "increment_epoch_count":
-                    # Step with improved epoch counts up to current location
-                    self.member_vars["scheduler_instance"].step(
-                        metrics=self.member_vars["last_improved_accuracies"][
+                        metrics=self.member_vars["accuracies"][
                             -((num_ticks - 1) - current_ticker) - 1
                         ]
                     )
@@ -1764,11 +1791,67 @@ class PAINeuronModuleTracker:
                     current_ticker += 1
                 if GPA.pc.get_verbose():
                     print(f"1 step {current_steps} to {learning_rate2}")
+                calls_without_change = 0
+            else:
+                calls_without_change += 1
 
             if mode == "increment_epoch_count":
                 current_ticker += 1
 
         return current_steps, learning_rate1
+
+    def reduce_plateau_learning_rate(self, num_drops):
+        """Drop a ReduceLROnPlateau learning rate a set number of times.
+
+        Each drop does what the scheduler does after patience runs out:
+        lr = max(lr * factor, min_lr). Then the scheduler state is reset,
+        so it starts from a clean state at the new learning rate.
+
+        Parameters
+        ----------
+        num_drops : int
+            The number of learning rate drops to apply.
+
+        Returns
+        -------
+        current_steps : int
+            The number of drops that changed the learning rate.
+        learning_rate : float
+            The final learning rate after the drops.
+
+        """
+        scheduler = self.member_vars["scheduler_instance"]
+        optimizer = self.member_vars["optimizer_instance"]
+        current_steps = 0
+        for _ in range(num_drops):
+            changed = False
+            for i, param_group in enumerate(optimizer.param_groups):
+                old_lr = float(param_group["lr"])
+                new_lr = max(old_lr * scheduler.factor, scheduler.min_lrs[i])
+                # Same eps check as ReduceLROnPlateau
+                if old_lr - new_lr > scheduler.eps:
+                    if isinstance(param_group["lr"], torch.Tensor):
+                        param_group["lr"].fill_(new_lr)
+                    else:
+                        param_group["lr"] = new_lr
+                    changed = True
+            if not changed:
+                _pai_log(
+                    "warning",
+                    f"Learning rate is at min_lr. Stopping after {current_steps} "
+                    f"of {num_drops} learning rate drops.",
+                )
+                break
+            current_steps += 1
+            if GPA.pc.get_verbose():
+                print(f"1 step {current_steps} to {optimizer.param_groups[-1]['lr']}")
+
+        # Same reset as ReduceLROnPlateau._reset()
+        scheduler.best = scheduler.mode_worse
+        scheduler.num_bad_epochs = 0
+        scheduler.cooldown_counter = 0
+        scheduler._last_lr = [float(group["lr"]) for group in optimizer.param_groups]
+        return current_steps, optimizer.param_groups[-1]["lr"]
 
     def setup_optimizer(self, net, opt_args, sched_args=None, parameters=None):
         """Initialize the optimizer and scheduler when added.
@@ -1790,6 +1873,20 @@ class PAINeuronModuleTracker:
             The initialized scheduler instance, or None if no scheduler was set.
 
         """
+        # Copy so the caller's opt_args is not changed
+        opt_args = dict(opt_args)
+        params_value = opt_args.get("params")
+        if params_value is not None and iter(params_value) is params_value:
+            # A generator such as model.parameters() can be used only one time.
+            params_value = list(params_value)
+            if len(params_value) == 0:
+                raise ValueError(
+                    "setup_optimizer got an empty 'params' iterator. This happens when "
+                    "the same opt_args dictionary with model.parameters() is used again "
+                    "after a restructure. Make a new dictionary with "
+                    "model.parameters() each time you call setup_optimizer."
+                )
+            opt_args["params"] = params_value
         if "weight_decay" in opt_args and not GPA.pc.get_weight_decay_accepted():
             _pai_log(
                 "warning",
@@ -1813,10 +1910,10 @@ class PAINeuronModuleTracker:
                     for param_group in parameters:
                         filtered_group_params = [p for p in param_group["params"] if p in params_set]
                         if filtered_group_params:
-                            filtered_params.append({
-                                "params": filtered_group_params,
-                                "weight_decay": param_group["weight_decay"]
-                            })
+                            # Keep all group keys, not just weight_decay
+                            new_group = dict(param_group)
+                            new_group["params"] = filtered_group_params
+                            filtered_params.append(new_group)
                     opt_args["params"] = filtered_params
                 else:
                     opt_args["params"] = params
@@ -1911,7 +2008,7 @@ class PAINeuronModuleTracker:
                 )
                 current_steps += additional_steps
 
-            if self.member_vars["mode"] == "n":  # or GPA.pc.get_learn_dendrites_live()
+            if self.member_vars["mode"] == "n":
                 initial = GPA.pc.get_initial_history_after_switches()
             else:
                 initial = 0
@@ -2034,7 +2131,6 @@ class PAINeuronModuleTracker:
         if GPA.pc.get_verbose():
             print("=== LR Optimization Check ===")
             print(f'  mode == "n": {self.member_vars["mode"] == "n"}')
-            # print(f"  get_learn_dendrites_live(): {GPA.pc.get_learn_dendrites_live()}")
             print(f'  committed_to_initial_rate: {GPA.pai_tracker.member_vars["committed_to_initial_rate"]}')
             print(f"  get_dont_give_up_unless_learning_rate_lowered(): {GPA.pc.get_dont_give_up_unless_learning_rate_lowered()}")
             print(f'  current_n_learning_rate_initial_skip_steps: {self.member_vars["current_n_learning_rate_initial_skip_steps"]}')
@@ -2044,7 +2140,7 @@ class PAINeuronModuleTracker:
             print("=============================")
         
         if (
-            (self.member_vars["mode"] == "n")  # or GPA.pc.get_learn_dendrites_live()
+            (self.member_vars["mode"] == "n")
             and (GPA.pai_tracker.member_vars["committed_to_initial_rate"] is False)
             and (GPA.pc.get_dont_give_up_unless_learning_rate_lowered())
             and (
@@ -2243,8 +2339,10 @@ class PAINeuronModuleTracker:
         else:
             self.member_vars["current_n_set_global_best"] = False
 
-        # Don't reset global best, but do reset current best
-        self.member_vars["current_best_validation_score"] = 0
+        # Don't reset global best
+        # reset current best only if the setting says so
+        if GPA.pc.get_reset_best_score_on_switch():
+            self.member_vars["current_best_validation_score"] = 0
         self.member_vars["initial_lr_test_epoch_count"] = -1
 
     def set_dendrite_training(self):
@@ -2273,6 +2371,11 @@ class PAINeuronModuleTracker:
             rather than a neuron layer.
             """
             if not worked:
+                # Keep the score lists aligned with neuron_module_vector
+                layer_index = self.neuron_module_vector.index(layer)
+                for score_key in ("best_scores", "current_scores"):
+                    if layer_index < len(self.member_vars[score_key]):
+                        del self.member_vars[score_key][layer_index]
                 self.neuron_module_vector.remove(layer)
 
         for layer in self.tracked_neuron_module_vector[:]:
@@ -2281,9 +2384,6 @@ class PAINeuronModuleTracker:
         self.create_new_dendrite_module()
         self.member_vars["mode"] = "p"
         self.member_vars["current_n_learning_rate_initial_skip_steps"] = 0
-
-        # if GPA.pc.get_learn_dendrites_live():
-        #     self.reset_vals_for_score_reset()
 
         self.member_vars["last_max_learning_rate_steps"] = self.member_vars[
             "current_step_count"
@@ -2316,10 +2416,6 @@ class PAINeuronModuleTracker:
         self.reset_vals_for_score_reset()
 
         self.member_vars["current_cycle_lr_max_scores"] = []
-        # if GPA.pc.get_learn_dendrites_live():
-        #     self.member_vars["last_max_learning_rate_steps"] = self.member_vars[
-        #         "current_step_count"
-        #     ]
         GPA.pai_tracker.member_vars["num_cycles"] += 1
 
         if GPA.pc.get_reset_best_score_on_switch():
@@ -2947,7 +3043,6 @@ class PAINeuronModuleTracker:
         # Scores only advance while candidate dendrites are being trained
         if (
             self.member_vars["mode"] != "p"
-            # and not GPA.pc.get_learn_dendrites_live()
         ):
             return {}
 
@@ -2984,7 +3079,6 @@ class PAINeuronModuleTracker:
             return {}
         if (
             self.member_vars["mode"] != "p"
-            # and not GPA.pc.get_learn_dendrites_live()
         ):
             return {}
 
@@ -3499,10 +3593,10 @@ class PAINeuronModuleTracker:
         -------
         net : object
             The potentially modified neural network model.
-        training_complete : bool
-            Whether training is complete.
         restructured : bool
             Whether the model has been restructured.
+        training_complete : bool
+            Whether training is complete.
 
         Notes
         -----
@@ -3541,7 +3635,6 @@ class PAINeuronModuleTracker:
         # If it is neuron training mode
         if (
             GPA.pai_tracker.member_vars["mode"] == "n"
-            # or GPA.pc.get_learn_dendrites_live()
         ):
             check_new_best(net, accuracy, epochs_since_cycle_switch)
         elif GPA.pc.get_perforated_backpropagation() and (
@@ -3575,7 +3668,6 @@ class PAINeuronModuleTracker:
             # If doing neuron training but this dendrite count didn't improve
             if (
                 (GPA.pai_tracker.member_vars["mode"] == "n")
-                # or GPA.pc.get_learn_dendrites_live()
             ) and (GPA.pai_tracker.member_vars["current_n_set_global_best"] is False):
                 new_restructuring_status_value, net = process_no_improvement(net)
                 # if this was the final try return that training is complete
